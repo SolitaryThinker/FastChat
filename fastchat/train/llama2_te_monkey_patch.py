@@ -14,6 +14,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaModel,
     rotate_half,
 )
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 
 # monkey patch for LlamaDecoderLayer
@@ -98,3 +99,9 @@ def forward(
 def replace_llama_with_te():
     LlamaDecoderLayer.__init__ = __init__
     LlamaDecoderLayer.forward = forward
+
+def test():
+    print("in test of te")
+
+if __name__ == '__main__':
+    test()
