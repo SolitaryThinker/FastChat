@@ -102,6 +102,60 @@ def replace_llama_with_te():
 
 def test():
     print("in test of te")
+    # from fastchat.train.llama_flash_attn_monkey_patch import forward as fastchat_forward
+    # from transformers.models.llama.configuration_llama import LlamaConfig
+
+    config = LlamaConfig(
+        hidden_size=1024,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=8,
+        max_position_embeddings=16,
+    )
+    device = torch.device("cuda")
+    model = LlamaModel(config)
+    attn = LlamaAttention(config).to(device).half()
+    decoder = LlamaDecoderLayer(config).to(device).half()
+    bsz, hs, seqlen = 2, config.hidden_size, config.max_position_embeddings
+    position_ids = torch.arange(seqlen, dtype=torch.long, device=device).view(
+        -1, seqlen
+    )
+
+    mask = torch.full((bsz, seqlen), True, dtype=torch.bool, device=device)
+    for i in range(4):
+        hidden = torch.rand((bsz, seqlen, hs), dtype=torch.float16, device=device)
+        if i:
+            mask[0, -i:] = False
+            mask[1, :i] = False
+
+        lmask = model._prepare_decoder_attention_mask(mask, hidden.shape[:2], hidden, 0)
+
+        ref, _, _ = decoder.forward(decoder, hidden, attention_mask=lmask,
+                position_ids=position_ids)
+
+        # ref, _, _ = attn.forward(
+            # hidden, attention_mask=lmask, position_ids=position_ids
+        # )
+
+        # fast, _, _ = fastchat_forward(
+            # attn, hidden, attention_mask=mask, position_ids=position_ids
+        # )
+
+        lmask = _prepare_decoder_attention_mask(
+            model, mask, hidden.shape[:2], hidden, 0
+        )
+        test, _, _ = forward(decoder, hidden, attention_mask=lmask,
+                position_ids=position_ids)
+        # test, _, _ = forward(
+            # attn, hidden, attention_mask=lmask, position_ids=position_ids
+        )
+
+        print(f"Mean(abs(ref)) = {torch.mean(torch.abs(ref))}")
+        # print(f"Mean(abs(ref - fast)) = {torch.mean(torch.abs(ref - fast))}")
+        print(f"Mean(abs(ref - test)) = {torch.mean(torch.abs(ref - test))}")
+        # print(f"Mean(abs(fast - test)) = {torch.mean(torch.abs(fast - test))}")
+        # print(f"allclose(fast, test) = {torch.allclose(fast, test)}")
+        print(f"allclose(ref, test) = {torch.allclose(ref, test)}")
 
 if __name__ == '__main__':
     test()
