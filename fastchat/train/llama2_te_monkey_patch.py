@@ -22,8 +22,37 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 import transformer_engine.pytorch as te
 
+# monkey patch for LlamaAttention
+def LlamaAttention__init__(self, config: LlamaConfig):
+    super(LlamaAttention, self).__init__()
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.num_heads = config.num_attention_heads
+    self.head_dim = self.hidden_size // self.num_heads
+    self.num_key_value_heads = config.num_key_value_heads
+    self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+    self.max_position_embeddings = config.max_position_embeddings
+    self.rope_theta = config.rope_theta
+
+    if (self.head_dim * self.num_heads) != self.hidden_size:
+        raise ValueError(
+            f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+            f" and `num_heads`: {self.num_heads})."
+        )
+    self.q_proj = te.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+    self.k_proj = te.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = te.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = te.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+    # self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+    # self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+    self._init_rope()
+
+
+
 # monkey patch for LlamaMLP
-def __init__(self, config):
+def LlamaMLP__init__(self, config):
     super(LlamaMLP, self).__init__()
     self.config = config
     self.hidden_size = config.hidden_size
@@ -35,88 +64,6 @@ def __init__(self, config):
     # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     # self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-
-"""
-# monkey patch for LlamaDecoderLayer
-def __init__(self, config: LlamaConfig):
-    # __class__ = LlamaMLP
-    super(LlamaMLP, self).__init__()
-    self.hidden_size = config.hidden_size
-    self.self_attn = (
-        LlamaAttention(config=config)
-        if not getattr(config, "_flash_attn_2_enabled", False)
-        else LlamaFlashAttention2(config=config)
-    )
-    # self.mlp = LlamaMLP(config)
-    self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    # self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    self.layernorm_mlp = te.LayerNormMLP(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            bias=False,
-            normalization='RMSNorm',
-            activation='swiglu')
-"""
-
-# monkey patch for LlamaDecoderLayer
-def forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    output_attentions: Optional[bool] = False,
-    use_cache: Optional[bool] = False,
-    padding_mask: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-    """
-    Args:
-        hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-        attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-            `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-        output_attentions (`bool`, *optional*):
-            Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-            returned tensors for more detail.
-        use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-            (see `past_key_values`).
-        past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
-    """
-
-    residual = hidden_states
-
-    hidden_states = self.input_layernorm(hidden_states)
-
-    # Self Attention
-    hidden_states, self_attn_weights, present_key_value = self.self_attn(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_value=past_key_value,
-        output_attentions=output_attentions,
-        use_cache=use_cache,
-        padding_mask=padding_mask,
-    )
-    hidden_states = residual + hidden_states
-
-    # Fully Connected
-    residual = hidden_states
-    # hidden_states = self.post_attention_layernorm(hidden_states)
-    # hidden_states = self.mlp(hidden_states)
-
-    # FIXME looking in to is_first_microbatch
-    hidden_states = self.layernorm_mlp(hidden_states)
-    hidden_states = residual + hidden_states
-
-    outputs = (hidden_states,)
-
-    if output_attentions:
-        outputs += (self_attn_weights,)
-
-    if use_cache:
-        outputs += (present_key_value,)
-
-    return outputs
 
 # Disable the transformation of the attention mask in LlamaModel as flash attention
 # takes a boolean key_padding_mask. Fills in the past kv length for use in forward.
@@ -146,7 +93,8 @@ def _prepare_decoder_attention_mask(
 def replace_llama_with_te():
     # LlamaDecoderLayer.__init__ = __init__
     # LlamaDecoderLayer.forward = forward
-    LlamaMLP.__init__ = __init__
+    LlamaAttention.__init__ = LlamaAttention__init__
+    LlamaMLP.__init__ = LlamaMLP__init__
 
 def test():
     print("in test of te")
