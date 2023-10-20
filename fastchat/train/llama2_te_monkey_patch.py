@@ -12,9 +12,12 @@ from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaFlashAttention2,
     LlamaModel,
+    LlamaDecoderLayer,
     rotate_half,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
+
+import transformer_engine.pytorch as te
 
 
 # monkey patch for LlamaDecoderLayer
@@ -96,6 +99,31 @@ def forward(
 
     return outputs
 
+# Disable the transformation of the attention mask in LlamaModel as flash attention
+# takes a boolean key_padding_mask. Fills in the past kv length for use in forward.
+def _prepare_decoder_attention_mask(
+    self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
+    # [bsz, seq_len]
+    if past_key_values_length > 0 and attention_mask is not None:
+        attention_mask = torch.cat(
+            (
+                torch.full(
+                    (input_shape[0], past_key_values_length),
+                    True,
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                ),
+                attention_mask,
+            ),
+            dim=-1,
+        )
+
+    if attention_mask is not None and torch.all(attention_mask):
+        return None  # This uses the faster call when training with full samples
+
+    return attention_mask
+
 def replace_llama_with_te():
     LlamaDecoderLayer.__init__ = __init__
     LlamaDecoderLayer.forward = forward
@@ -103,7 +131,7 @@ def replace_llama_with_te():
 def test():
     print("in test of te")
     # from fastchat.train.llama_flash_attn_monkey_patch import forward as fastchat_forward
-    # from transformers.models.llama.configuration_llama import LlamaConfig
+    from transformers.models.llama.configuration_llama import LlamaConfig
 
     config = LlamaConfig(
         hidden_size=1024,
@@ -115,23 +143,39 @@ def test():
     device = torch.device("cuda")
     model = LlamaModel(config)
     attn = LlamaAttention(config).to(device).half()
-    decoder = LlamaDecoderLayer(config).to(device).half()
+    decoder = LlamaDecoderLayer(config).to(device)
+
+    # LlamaDecerLayer.__init__ = __init__
+    test_decoder = LlamaDecoderLayer(config).to(device)
+
     bsz, hs, seqlen = 2, config.hidden_size, config.max_position_embeddings
     position_ids = torch.arange(seqlen, dtype=torch.long, device=device).view(
         -1, seqlen
     )
+    print("after")
 
     mask = torch.full((bsz, seqlen), True, dtype=torch.bool, device=device)
     for i in range(4):
-        hidden = torch.rand((bsz, seqlen, hs), dtype=torch.float16, device=device)
+        hidden = torch.rand((bsz, seqlen, hs), dtype=torch.float32, device=device)
         if i:
             mask[0, -i:] = False
             mask[1, :i] = False
 
         lmask = model._prepare_decoder_attention_mask(mask, hidden.shape[:2], hidden, 0)
 
-        ref, _, _ = decoder.forward(decoder, hidden, attention_mask=lmask,
-                position_ids=position_ids)
+        # ref = decoder.forward(hidden, attention_mask=lmask, position_ids=position_ids)
+        decoder.layernorm_mlp = te.LayerNormMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            eps=config.rms_norm_eps,
+            bias=False,
+            normalization='RMSNorm',
+            activation='swiglu',
+            init_method=lambda x: decoder.mlp.down_proj.weight,
+            output_layer_init_method=lambda x: decoder.mlp.down_proj.weight,
+            )
+        ref = decoder.forward(hidden, position_ids=position_ids)
+        ref = ref[0]
 
         # ref, _, _ = attn.forward(
             # hidden, attention_mask=lmask, position_ids=position_ids
@@ -144,11 +188,18 @@ def test():
         lmask = _prepare_decoder_attention_mask(
             model, mask, hidden.shape[:2], hidden, 0
         )
-        test, _, _ = forward(decoder, hidden, attention_mask=lmask,
+        # test = forward(test_decoder, hidden, attention_mask=mask,
+                # position_ids=position_ids)
+        # test = forward(test_decoder, hidden,
+                # position_ids=position_ids)
+        test = forward(decoder, hidden,
                 position_ids=position_ids)
+        test = test[0]
+        print(test)
+        print(ref)
         # test, _, _ = forward(
             # attn, hidden, attention_mask=lmask, position_ids=position_ids
-        )
+        # )
 
         print(f"Mean(abs(ref)) = {torch.mean(torch.abs(ref))}")
         # print(f"Mean(abs(ref - fast)) = {torch.mean(torch.abs(ref - fast))}")
