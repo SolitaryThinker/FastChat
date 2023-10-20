@@ -2,27 +2,45 @@ import warnings
 from typing import Optional, Tuple
 
 import torch
+from torch import nn
 from flash_attn import __version__ as flash_attn_version
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import (
     flash_attn_func,
     flash_attn_varlen_kvpacked_func,
 )
+from transformers.activations import ACT2FN
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaFlashAttention2,
     LlamaModel,
     LlamaDecoderLayer,
+    LlamaMLP,
     rotate_half,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 import transformer_engine.pytorch as te
 
+# monkey patch for LlamaMLP
+def __init__(self, config):
+    super(LlamaMLP, self).__init__()
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.intermediate_size = config.intermediate_size
+    self.gate_proj = te.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.up_proj = te.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    self.down_proj = te.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    # self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    # self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+    # self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    self.act_fn = ACT2FN[config.hidden_act]
 
+"""
 # monkey patch for LlamaDecoderLayer
 def __init__(self, config: LlamaConfig):
-    super().__init__()
+    # __class__ = LlamaMLP
+    super(LlamaMLP, self).__init__()
     self.hidden_size = config.hidden_size
     self.self_attn = (
         LlamaAttention(config=config)
@@ -38,6 +56,7 @@ def __init__(self, config: LlamaConfig):
             bias=False,
             normalization='RMSNorm',
             activation='swiglu')
+"""
 
 # monkey patch for LlamaDecoderLayer
 def forward(
@@ -125,8 +144,9 @@ def _prepare_decoder_attention_mask(
     return attention_mask
 
 def replace_llama_with_te():
-    LlamaDecoderLayer.__init__ = __init__
-    LlamaDecoderLayer.forward = forward
+    # LlamaDecoderLayer.__init__ = __init__
+    # LlamaDecoderLayer.forward = forward
+    LlamaMLP.__init__ = __init__
 
 def test():
     print("in test of te")
@@ -143,10 +163,14 @@ def test():
     device = torch.device("cuda")
     model = LlamaModel(config)
     attn = LlamaAttention(config).to(device).half()
-    decoder = LlamaDecoderLayer(config).to(device)
+    # decoder = LlamaDecoderLayer(config).to(device)
+    decoder = LlamaMLP(config).to(device)
 
     # LlamaDecerLayer.__init__ = __init__
-    test_decoder = LlamaDecoderLayer(config).to(device)
+    # LlamaMLP.__init__ = __init__
+    # test_decoder = LlamaDecoderLayer(config).to(device)
+    # test_decoder = LlamaDecoderLayer(config).to(device)
+
 
     bsz, hs, seqlen = 2, config.hidden_size, config.max_position_embeddings
     position_ids = torch.arange(seqlen, dtype=torch.long, device=device).view(
@@ -164,18 +188,45 @@ def test():
         lmask = model._prepare_decoder_attention_mask(mask, hidden.shape[:2], hidden, 0)
 
         # ref = decoder.forward(hidden, attention_mask=lmask, position_ids=position_ids)
-        decoder.layernorm_mlp = te.LayerNormMLP(
-            config.hidden_size,
-            config.intermediate_size,
-            eps=config.rms_norm_eps,
-            bias=False,
-            normalization='RMSNorm',
-            activation='swiglu',
-            init_method=lambda x: decoder.mlp.down_proj.weight,
-            output_layer_init_method=lambda x: decoder.mlp.down_proj.weight,
-            )
-        ref = decoder.forward(hidden, position_ids=position_ids)
-        ref = ref[0]
+
+        # decoder.layernorm_mlp = te.LayerNormMLP(
+            # config.hidden_size,
+            # config.intermediate_size,
+            # eps=config.rms_norm_eps,
+            # bias=False,
+            # normalization='RMSNorm',
+            # activation='swiglu',
+            # init_method=lambda x: decoder.mlp.down_proj.weight,
+            # output_layer_init_method=lambda x: decoder.mlp.down_proj.weight,
+            # )
+        ref = decoder.forward(hidden)
+        # ref = decoder.forward(hidden, position_ids=position_ids)
+        # ref = ref[0]
+        # with torch.no_grad():
+
+        w = decoder.gate_proj.weight.data
+        decoder.gate_proj = te.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                )
+        decoder.gate_proj.weight.data = w
+
+        w = decoder.up_proj.weight.data
+        decoder.up_proj = te.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                )
+        decoder.up_proj.weight.data = w
+
+        w = decoder.down_proj.weight.data
+        decoder.down_proj = te.Linear(
+                config.intermediate_size,
+                config.hidden_size,
+                bias=False,
+                )
+        decoder.down_proj.weight.data = w
 
         # ref, _, _ = attn.forward(
             # hidden, attention_mask=lmask, position_ids=position_ids
@@ -192,11 +243,11 @@ def test():
                 # position_ids=position_ids)
         # test = forward(test_decoder, hidden,
                 # position_ids=position_ids)
-        test = forward(decoder, hidden,
-                position_ids=position_ids)
-        test = test[0]
-        print(test)
-        print(ref)
+        test = decoder.forward(hidden)
+
+        # test = test[0]
+        # print(test)
+        # print(ref)
         # test, _, _ = forward(
             # attn, hidden, attention_mask=lmask, position_ids=position_ids
         # )
