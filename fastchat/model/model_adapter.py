@@ -37,10 +37,17 @@ from fastchat.model.model_exllama import generate_stream_exllama
 from fastchat.model.monkey_patch_non_inplace import (
     replace_llama_attn_with_non_inplace_operations,
 )
+from fastchat.train.llama2_flash_attn_monkey_patch import (
+    replace_llama_attn_with_flash_attn
+)
+from fastchat.train.llama2_te_monkey_patch import (
+    replace_llama_with_te
+)
 from fastchat.modules.awq import AWQConfig, load_awq_quantized
 from fastchat.modules.exllama import ExllamaConfig, load_exllama_model
 from fastchat.modules.gptq import GptqConfig, load_gptq_quantized
 from fastchat.utils import get_gpu_memory
+import transformer_engine.pytorch as te
 
 # Check an environment variable to check if we should be sharing Peft model
 # weights.  When false we treat all Peft models as separate.
@@ -584,11 +591,64 @@ class VicunaAdapter(BaseModelAdapter):
         tokenizer = AutoTokenizer.from_pretrained(
             model_path, use_fast=self.use_fast_tokenizer, revision=revision
         )
+        print("vicuna model")
+        # replace_llama_with_te()
+        # replace_llama_attn_with_flash_attn()
+
+        # registry
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             low_cpu_mem_usage=True,
             **from_pretrained_kwargs,
         )
+        # model.model.
+        for layer in model.model.layers:
+            hidden_size = layer.mlp.config.hidden_size
+            intermediate_size = layer.mlp.config.intermediate_size
+            fc1 = layer.mlp.gate_proj.weight
+            fc2 = layer.mlp.up_proj.weight
+            fc3 = layer.mlp.down_proj.weight
+
+            layer.mlp.gate_proj = te.Linear(hidden_size, intermediate_size,
+                    bias=False, params_dtype=torch.float16)
+            layer.mlp.up_proj = te.Linear(hidden_size, intermediate_size,
+                    bias=False, params_dtype=torch.float16)
+            layer.mlp.down_proj = te.Linear(intermediate_size, hidden_size,
+                    bias=False, params_dtype=torch.float16)
+
+            layer.mlp.gate_proj.weight.data = fc1.data
+            layer.mlp.up_proj.weight.data = fc2.data
+            layer.mlp.down_proj.weight.data = fc3.data
+
+            # attention
+            config = layer.self_attn.config
+            q = layer.self_attn.q_proj.weight
+            k = layer.self_attn.k_proj.weight
+            v = layer.self_attn.v_proj.weight
+            o = layer.self_attn.o_proj.weight
+            num_heads = config.num_attention_heads
+            head_dim = hidden_size // num_heads
+            num_key_value_heads = config.num_key_value_heads
+
+            layer.self_attn.q_proj = te.Linear(hidden_size, num_heads
+                    * head_dim, bias=config.attention_bias,
+                    params_dtype=torch.float16)
+            layer.self_attn.k_proj = te.Linear(hidden_size,
+                    num_key_value_heads * head_dim,
+                    bias=config.attention_bias, params_dtype=torch.float16)
+            layer.self_attn.v_proj = te.Linear(hidden_size,
+                    num_key_value_heads * head_dim,
+                    bias=config.attention_bias, params_dtype=torch.float16)
+            layer.self_attn.o_proj = te.Linear(num_heads * head_dim,
+                    hidden_size, bias=config.attention_bias,
+                    params_dtype=torch.float16)
+
+            layer.self_attn.q_proj.weight.data = q.data
+            layer.self_attn.k_proj.weight.data = k.data
+            layer.self_attn.v_proj.weight.data = v.data
+            layer.self_attn.o_proj.weight.data = o.data
+
+
         self.raise_warning_for_old_weights(model)
         return model, tokenizer
 
@@ -1315,6 +1375,8 @@ class Llama2Adapter(BaseModelAdapter):
         return "llama-2" in model_path.lower()
 
     def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+        print("llama2  model")
+        # replace_llama_with_te()
         model, tokenizer = super().load_model(model_path, from_pretrained_kwargs)
         model.config.eos_token_id = tokenizer.eos_token_id
         model.config.pad_token_id = tokenizer.pad_token_id
